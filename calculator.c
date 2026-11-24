@@ -1,3 +1,29 @@
+/*
+ * clauclator.c - a scientific + university-level math calculator in C
+ *
+ * Build:  gcc -O2 -o clauclator clauclator.c -lm
+ * Run:    ./clauclator
+ *
+ * Expressions : + - * / % ^ ! ( ) , implicit multiplication (2x, 3(4+1))
+ * Constants   : pi e phi ans      Variables: x y a=5 ...
+ * Functions   : sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh
+ *               exp ln log log2 sqrt cbrt abs floor ceil round sign
+ *               fact gamma erf pow min max mod gcd lcm ncr npr hypot deg rad
+ * Unicode     : x², x³, x¹⁰, −, ×, ÷, π, √(...) are understood
+ * Equations   : 3(x - 2) + 4 = 2(x + 5) - 7   (solves for x; linear exactly, others numerically)
+ * Commands    :
+ *   diff  EXPR @ X0            derivative at a point (variable x)
+ *   int   EXPR from A to B     definite integral (variable x), adaptive Simpson
+ *   root  EXPR near G          solve EXPR = 0 (Newton + bisection fallback)
+ *   limit EXPR @ X0            numerical limit as x -> X0 (variable x)
+ *   sum   EXPR from A to B     summation (variable k)
+ *   prod  EXPR from A to B     product   (variable k)
+ *   taylor EXPR @ X0 order N   Taylor coefficients about X0
+ *   factor N                   prime factorisation
+ *   isprime N
+ *   det N / solve N            determinant / linear system (matrix read from input)
+ *   help, quit
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +173,7 @@ static double eval_str(const char *s) {
     return v;
 }
 
+/* ---------- calculus helpers ---------- */
 static char gexpr[512];
 static double fx(double x) { setvar("x", x); return eval_str(gexpr); }
 
@@ -204,6 +231,7 @@ static int find_root(double g, double *out) {
     return 0;
 }
 
+/* ---------- number theory & linear algebra ---------- */
 static void factor(uint64_t n) {
     if (n < 2) { printf("%llu has no prime factorisation\n", (unsigned long long)n); return; }
     printf("%llu =", (unsigned long long)n);
@@ -268,7 +296,39 @@ static void help(void) {
     puts("  factor N | isprime N | det N | solve N | help | quit");
 }
 
+static void normalize(char *s) {
+    char out[2048], *w = out, *orig = s;           /* rewrite into a separate buffer: output can be longer than input */
+    int sup = 0;                                   /* inside a run of superscript digits */
+    while (*s) {
+        unsigned char c = (unsigned char)s[0], c1 = (unsigned char)s[1], c2 = c1 ? (unsigned char)s[2] : 0;
+        int d = -1, len = 0;
+        if (c == 0xC2 && c1 == 0xB2) { d = 2; len = 2; }
+        else if (c == 0xC2 && c1 == 0xB3) { d = 3; len = 2; }
+        else if (c == 0xC2 && c1 == 0xB9) { d = 1; len = 2; }
+        else if (c == 0xE2 && c1 == 0x81 && c2 == 0xB0) { d = 0; len = 3; }
+        else if (c == 0xE2 && c1 == 0x81 && c2 >= 0xB4 && c2 <= 0xB9) { d = 4 + (c2 - 0xB4); len = 3; }
+        else if (c == 0xE2 && c1 == 0x81 && c2 == 0xBB) { d = 10; len = 3; }          /* superscript minus */
+        if (d >= 0) {
+            if (!sup) *w++ = '^';
+            *w++ = d == 10 ? '-' : (char)('0' + d);
+            sup = 1; s += len; continue;
+        }
+        sup = 0;
+        if (c == 0xE2 && c1 == 0x88 && c2 == 0x9A) { *w++='s'; *w++='q'; *w++='r'; *w++='t'; s += 3; continue; } /* sqrt sign */
+        if (c == 0xE2 && c1 == 0x88 && c2 == 0x92) { *w++ = '-'; s += 3; }          /* U+2212 minus */
+        else if (c == 0xE2 && c1 == 0x80 && (c2 == 0x93 || c2 == 0x94)) { *w++ = '-'; s += 3; } /* en/em dash */
+        else if (c == 0xC3 && c1 == 0x97) { *w++ = '*'; s += 2; }                    /* x */
+        else if (c == 0xC3 && c1 == 0xB7) { *w++ = '/'; s += 2; }                    /* division sign */
+        else if (c == 0xCF && c1 == 0x80) { *w++ = 'p'; *w++ = 'i'; s += 2; }        /* pi */
+        else *w++ = *s++;
+    }
+    *w = 0;
+    out[511] = 0;                                  /* callers' buffers hold 512 bytes */
+    strcpy(orig, out);
+}
+
 static void run(char *line) {
+    normalize(line);
     char *s = line;
     while (isspace((unsigned char)*s)) s++;
     size_t L = strlen(s); while (L && isspace((unsigned char)s[L-1])) s[--L] = 0;
@@ -371,6 +431,32 @@ static void run(char *line) {
         while (*q == ' ') q++;
         if (i && isalpha((unsigned char)nm[0]) && *q == '=' && q[1] != '=') {
             double v = eval_str(q + 1); if (ok()) { setvar(nm, v); printf("%s = %.12g\n", nm, v); }
+            return;
+        }
+    }
+    /* equation: LHS = RHS  -> solve for x */
+    {
+        char *eq = strchr(s, '=');
+        if (eq && eq[1] != '=') {
+            *eq = 0;
+            snprintf(gexpr, sizeof gexpr, "(%s)-(%s)", s, eq + 1);
+            double f0 = fx(0), f1 = fx(1), f2 = fx(2);
+            if (!ok()) return;
+            double a = f1 - f0;
+            if (fabs((f2 - f1) - a) < 1e-9 * fmax(1.0, fabs(a))) {      /* linear in x: exact */
+                if (fabs(a) < 1e-12) puts(fabs(f0) < 1e-12 ? "identity: true for every x" : "no solution");
+                else { printf("x "); pr(-f0 / a); }
+            } else {                                                    /* nonlinear: search for several roots */
+                double found[16]; int nf = 0;
+                for (double g = -50; g <= 50; g += 0.5) {
+                    double r; if (!find_root(g, &r)) { err = 0; continue; }
+                    int dup = 0; for (int i = 0; i < nf; i++) if (fabs(found[i] - r) < 1e-6) dup = 1;
+                    if (!dup && fabs(fx(r)) < 1e-7 && nf < 16) found[nf++] = r;
+                }
+                err = 0;
+                if (!nf) puts("no real solution found for x in [-50, 50]");
+                for (int i = 0; i < nf; i++) printf("x = %.12g\n", found[i]);
+            }
             return;
         }
     }
